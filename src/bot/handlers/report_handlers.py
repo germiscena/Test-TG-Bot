@@ -37,7 +37,7 @@ async def handle_voice_report(message: Message, state: FSMContext, bot: Bot):
         await status_msg.edit_text(f"❌ Ошибка обработки голосового сообщения: {e}")
 
 
-@router.message(F.text, F.text.regexp(r"^/[a-zA-Z0-9_]+").is_(False))
+@router.message(F.text, ~F.text.startswith("/"))
 async def handle_text_report(message: Message, state: FSMContext):
     await process_report_text(message.text, is_voice=False, message=message, state=state)
 
