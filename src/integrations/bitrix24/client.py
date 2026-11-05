@@ -1,10 +1,26 @@
 import logging
+import socket
 import httpx
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from config.settings import settings
 from src.core.models import Position
 
 logger = logging.getLogger(__name__)
+
+
+def _get_lan_transport() -> Optional[httpx.AsyncHTTPTransport]:
+    """
+    Находит физический LAN IP (192.168.x.x / 172.x.x), чтобы обойти VPN-туннель
+    для обращения к российским облачным сервисам (bitrix24.ru), которые блокируют зарубежные IP.
+    """
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if ip.startswith("192.168.") or ip.startswith("172."):
+                return httpx.AsyncHTTPTransport(local_address=ip)
+    except Exception:
+        pass
+    return None
 
 
 class Bitrix24Client:
@@ -53,17 +69,26 @@ class Bitrix24Client:
             }
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-                task_id = data.get("result", {}).get("task", {}).get("id") or data.get("result", "")
-                logger.info(f"Created Bitrix24 task id: {task_id}")
-                return True, f"Задача в Битрикс24 успешно создана (ID: {task_id})"
-        except Exception as e:
-            logger.error(f"Failed to create Bitrix24 task: {e}", exc_info=True)
-            return False, f"Ошибка при обращении к Битрикс24: {str(e)}"
+        # 1. Сначала пробуем прямое подключение в обход VPN через LAN-адаптер (если включен VPN)
+        lan_transport = _get_lan_transport()
+        transports_to_try = [lan_transport, None] if lan_transport else [None]
+
+        last_error = None
+        for transport in transports_to_try:
+            try:
+                async with httpx.AsyncClient(transport=transport, timeout=12.0) as client:
+                    resp = await client.post(url, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    task_id = data.get("result", {}).get("task", {}).get("id") or data.get("result", "")
+                    logger.info(f"Created Bitrix24 task id: {task_id}")
+                    return True, f"Задача в Битрикс24 успешно создана (ID: {task_id})"
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Bitrix24 attempt with transport {transport} failed: {e}")
+
+        logger.error(f"Failed to create Bitrix24 task: {last_error}", exc_info=True)
+        return False, f"Ошибка при обращении к Битрикс24: {str(last_error)}"
 
 
 bitrix_client = Bitrix24Client()
