@@ -1,4 +1,5 @@
 import pytest
+from config.settings import settings
 from src.integrations.google_sheets.repository import GoogleSheetsRepository
 from src.integrations.bitrix24.client import bitrix_client
 from src.services.llm_service import llm_service
@@ -7,7 +8,11 @@ from src.core.models import ReportDraft, MatchStatus
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_report_recording():
+async def test_end_to_end_report_recording(monkeypatch):
+    # Изолируем автотест от реальных сетевых вызовов, тестируя полный цикл бизнес-логики
+    monkeypatch.setattr(settings, "GOOGLE_SPREADSHEET_ID", None)
+    monkeypatch.setattr(settings, "BITRIX24_WEBHOOK_URL", None)
+
     # 1. Initialize repo with local fallback
     repo = GoogleSheetsRepository()
     catalog = await repo.get_catalog(force_refresh=True)

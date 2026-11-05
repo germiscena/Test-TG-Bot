@@ -151,6 +151,10 @@ class GoogleSheetsRepository:
             })
             summary.append(f"Строка {row_1based}: {existing_val} + {new_volume} = {val_to_write} {pos.unit}")
 
+            # Обновляем локальное состояние переданного объекта
+            pos.executed_volume += new_volume
+            pos.remaining_volume = max(0.0, pos.remaining_volume - new_volume)
+
         worksheet.batch_update(updates)
         self.invalidate_cache()
         return True, f"Успешно записано в Google Sheets ({date_str}):\n" + "\n".join(summary)
