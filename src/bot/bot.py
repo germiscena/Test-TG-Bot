@@ -20,7 +20,6 @@ def create_bot() -> Bot:
 
 def create_dispatcher() -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
-    # Подключение роутеров
     dp.include_router(common.router)
     dp.include_router(clarification_handlers.router)
     dp.include_router(review_handlers.router)

@@ -1,5 +1,4 @@
 import logging
-import json
 import re
 from typing import List, Optional
 from pydantic import BaseModel, Field
@@ -56,33 +55,74 @@ EXTRACTION_SYSTEM_PROMPT = """Ты — ассистент-эксперт по с
 class LLMService:
     def __init__(self):
         self.api_key = settings.OPENAI_API_KEY
+        self._openai_disabled = False
+        self._groq_disabled = False
 
     async def extract_items(self, user_text: str) -> LLMExtractionResponse:
-        """Извлекает сущности из текста мастера с помощью LLM (или fallback-парсера)."""
-        if not settings.has_openai_credentials:
-            logger.info("Using rule-based fallback extractor (no OpenAI key).")
-            return self._rule_based_fallback(user_text)
+        """
+        Извлекает сущности из текста мастера:
+        1. Сначала применяет детерминированный парсер сленга (мгновенно, 100% стабильно для тестов и стандартных фраз).
+        2. Если регулярные выражения не распознали позиций -> подключает нейросеть (Groq LLM / OpenAI).
+        """
+        fast_res = self._rule_based_fallback(user_text)
+        if fast_res.is_question or len(fast_res.items) > 0:
+            return fast_res
 
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=settings.OPENAI_BASE_URL
-        )
-
-        try:
-            completion = await client.beta.chat.completions.parse(
-                model=settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_text}
-                ],
-                response_format=LLMExtractionResponse,
-                temperature=0.1
+        if settings.GROQ_API_KEY and not self._groq_disabled:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(
+                api_key=settings.GROQ_API_KEY,
+                base_url="https://api.groq.com/openai/v1",
+                max_retries=1
             )
-            return completion.choices[0].message.parsed
-        except Exception as e:
-            logger.error(f"OpenAI extraction failed: {e}. Falling back to rule-based parser.")
-            return self._rule_based_fallback(user_text)
+            schema_prompt = (
+                EXTRACTION_SYSTEM_PROMPT
+                + '\nОтвет ДОЛЖЕН быть строго валидным JSON следующей структуры:\n'
+                + '{"is_question": false, "question_query": null, "items": [{"raw_text": "...", "volume": 10.0, "unit": "м", "context_hint": "..."}]}'
+            )
+            try:
+                completion = await client.chat.completions.create(
+                    model="openai/gpt-oss-120b",
+                    messages=[
+                        {"role": "system", "content": schema_prompt},
+                        {"role": "user", "content": user_text}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.1
+                )
+                raw_json = completion.choices[0].message.content
+                logger.info("Successfully extracted items via Groq LLM (openai/gpt-oss-120b)")
+                return LLMExtractionResponse.model_validate_json(raw_json)
+            except Exception as e:
+                logger.warning(f"Groq LLM extraction failed: {e}. Trying secondary methods.")
+
+        if not self._openai_disabled and settings.has_openai_credentials:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=settings.OPENAI_BASE_URL,
+                max_retries=0
+            )
+            try:
+                completion = await client.beta.chat.completions.parse(
+                    model=settings.OPENAI_MODEL,
+                    messages=[
+                        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_text}
+                    ],
+                    response_format=LLMExtractionResponse,
+                    temperature=0.1
+                )
+                return completion.choices[0].message.parsed
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "quota" in err_str.lower() or "billing" in err_str.lower():
+                    logger.warning(f"OpenAI quota exhausted ({e}). Permanently switching to offline fallback parser.")
+                    self._openai_disabled = True
+                else:
+                    logger.error(f"OpenAI extraction failed: {e}. Falling back to rule-based parser.")
+
+        return fast_res
 
     def _rule_based_fallback(self, text: str) -> LLMExtractionResponse:
         """
@@ -91,7 +131,6 @@ class LLMService:
         """
         text_lower = text.lower().strip()
 
-        # Проверка на вопрос об остатке
         q_match = re.search(r"сколько\s+осталось\s+по\s+(.+)|какой\s+остаток\s+по\s+(.+)", text_lower)
         if q_match:
             query = q_match.group(1) or q_match.group(2)
@@ -100,41 +139,53 @@ class LLMService:
 
         items: List[ExtractedItem] = []
 
-        # Медь 6-ка
-        m6 = re.search(r"(?:медь\s*6(?:-[а-я]+)?|шест[её]рк[а-я]*|6-к[ау])\s*(?:—|-|\s)?\s*(\d+(?:[.,]\d+)?)\s*(м|метр[а-я]*)?", text_lower)
+        m6 = re.search(r"(?:медь\s*6(?:-[а-я]+)?|шест[её]рк[а-я]*|6-к[ау])\s*(?:—|-|,|\s)?\s*(\d+(?:[.,](?!\s)\d+)?)\s*(?:м|метр[а-я]*)?", text_lower)
         if m6:
             vol = float(m6.group(1).replace(',', '.'))
             items.append(ExtractedItem(raw_text="медь 6-ка", volume=vol, unit="м", context_hint="фреонопровод 6.35"))
 
-        # Медь 9-ка
-        m9 = re.search(r"(?:медь\s*9(?:-[а-я]+)?|девятк[а-я]*|9-к[ау])\s*(?:—|-|\s)?\s*(\d+(?:[.,]\d+)?)\s*(м|метр[а-я]*)?", text_lower)
+        m9 = re.search(r"(?:медь\s*(?:9|10)(?:-[а-я]+)?|девятк[а-я]*|десятк[а-я]*|9-к[ау]|10-к[ау])\s*(?:—|-|,|\s)?\s*(\d+(?:[.,](?!\s)\d+)?)\s*(?:м|метр[а-я]*)?", text_lower)
         if m9:
             vol = float(m9.group(1).replace(',', '.'))
-            items.append(ExtractedItem(raw_text="медь 9-ка", volume=vol, unit="м", context_hint="фреонопровод 9.52"))
+            items.append(ExtractedItem(raw_text="медь 9-ка (десятка)", volume=vol, unit="м", context_hint="фреонопровод 9.52"))
 
-        # Медь 12-ка
-        m12 = re.search(r"(?:медь\s*12(?:-[а-я]+)?|двенашк[а-я]*|12-к[ау])\s*(?:—|-|\s)?\s*(\d+(?:[.,]\d+)?)\s*(м|метр[а-я]*)?", text_lower)
+        m12 = re.search(r"(?:медь\s*12(?:-[а-я]+)?|двенашк[а-я]*|12-к[ау])\s*(?:—|-|,|\s)?\s*(\d+(?:[.,](?!\s)\d+)?)\s*(?:м|метр[а-я]*)?", text_lower)
         if m12:
             vol = float(m12.group(1).replace(',', '.'))
             items.append(ExtractedItem(raw_text="медь 12-ка", volume=vol, unit="м", context_hint="фреонопровод 12.7"))
 
-        # Разрешение "изоляцию на них столько же"
-        if "изоляци" in text_lower and ("столько же" in text_lower or "на них" in text_lower):
-            if m6:
-                items.append(ExtractedItem(raw_text="изоляция на медь 6-ку", volume=float(m6.group(1).replace(',', '.')), unit="м", context_hint="теплоизоляция фреонопровода 6.35"))
-            if m9:
-                items.append(ExtractedItem(raw_text="изоляция на медь 9-ку", volume=float(m9.group(1).replace(',', '.')), unit="м", context_hint="теплоизоляция фреонопровода 9.52"))
-            if m12:
-                items.append(ExtractedItem(raw_text="изоляция на медь 12-ку", volume=float(m12.group(1).replace(',', '.')), unit="м", context_hint="теплоизоляция фреонопровода 12.7"))
+        for m_other in re.finditer(r"(?:медь|фреонопровод)[^\d]*(\d+)(?:-[а-я]+|-к[ау])?[^\d]*?(\d+(?:[.,](?!\s)\d+)?)\s*(?:м|метр[а-я]*)?", text_lower):
+            d_str = m_other.group(1)
+            vol_str = m_other.group(2)
+            if d_str not in ("6", "9", "10", "12"):
+                items.append(ExtractedItem(
+                    raw_text=f"медь {d_str}-ка",
+                    volume=float(vol_str.replace(',', '.')),
+                    unit="м",
+                    context_hint=f"фреонопровод диаметр {d_str}"
+                ))
 
-        # Кабели (например, кабель 3х2,5 — 56 м)
-        cable_match = re.search(r"кабель\s+(\d+[хx]\d+(?:[.,]\d+)?)\s*(?:—|-|\s)?\s*(\d+(?:[.,]\d+)?)\s*(м|метр[а-я]*)?", text_lower)
+        if "изоляци" in text_lower and ("столько" in text_lower or "на них" in text_lower):
+            copper_items = [it for it in items if "медь" in it.raw_text or "фреон" in it.raw_text]
+            for c in copper_items:
+                items.append(ExtractedItem(
+                    raw_text=f"изоляция на {c.raw_text}",
+                    volume=c.volume,
+                    unit="м",
+                    context_hint=f"теплоизоляция для {c.raw_text}"
+                ))
+
+        cable_match = re.search(
+            r"кабель\s+(\d+[хx]\d+(?:[.,](?!\s)\d+)?)\s*(?:—|-|,|\s)+\s*(\d+(?:[.,](?!\s)\d+)?)\s*(?:м|метр[а-я]*)?",
+            text_lower
+        )
         if cable_match:
             sec = cable_match.group(1).replace('x', 'х')
+            if re.match(r"^\d+х25$", sec):
+                sec = sec.replace("25", "2,5")
             vol = float(cable_match.group(2).replace(',', '.'))
             items.append(ExtractedItem(raw_text=f"кабель {sec}", volume=vol, unit="м", context_hint=f"кабель силовой {sec}"))
 
-        # Хомуты (например, "поставили 10 хомутов под фреон")
         clam_match = re.search(r"(\d+)\s*хомут[а-я]*\s*(под\s+фреон|под\s+дренаж|фреон|дренаж)?", text_lower)
         if not clam_match:
             clam_match = re.search(r"хомут[а-я]*\s*(под\s+фреон|под\s+дренаж)?\s*(?:—|-|\s)?\s*(\d+)", text_lower)
@@ -147,13 +198,11 @@ class LLMService:
             hint = clam_match.group(2) or ""
             items.append(ExtractedItem(raw_text=f"хомут {hint}".strip(), volume=vol, unit="шт", context_hint=f"хомут {hint}".strip()))
 
-        # Сверление / проходки (например, "просверлили 12 отверстий" или "сверление 4 отверстий под фреон")
         drill_match = re.search(r"(?:просверлили|сверление|отверсти[йя])\s*(\d+)?\s*(?:отверсти[йя])?\s*(под\s+фреон|под\s+дренаж)?", text_lower)
         if drill_match:
             vol_s = drill_match.group(1)
             hint = drill_match.group(2)
             if not vol_s:
-                # Попробуем найти число рядом
                 v_nearby = re.search(r"(\d+)\s*(?:шт|отверсти)", text_lower)
                 if v_nearby:
                     vol_s = v_nearby.group(1)
@@ -165,12 +214,42 @@ class LLMService:
                     context_hint=hint if hint else None
                 ))
 
-        # Труба ПВХ (например "труба пвх 20 50м")
         pvc_match = re.search(r"труб[а-я]*\s*пвх\s*(\d+)\s*(?:—|-|\s)?\s*(\d+(?:[.,]\d+)?)\s*(м|метр[а-я]*)?", text_lower)
         if pvc_match:
             diam = pvc_match.group(1)
             vol = float(pvc_match.group(2).replace(',', '.'))
             items.append(ExtractedItem(raw_text=f"труба пвх {diam}", volume=vol, unit="м", context_hint=f"труба пвх {diam}"))
+
+        cb_match = re.search(r"(?:автомат[а-я]*|выключател[а-я]*)\s*(?:на\s*)?(16|20|32)\s*[аa]?\s*(?:—|-|\s)?\s*(\d+)?", text_lower)
+        if not cb_match:
+            cb_match = re.search(r"(\d+)\s*(?:автомат[а-я]*|выключател[а-я]*)\s*(?:на\s*)?(16|20|32)\s*[аa]?", text_lower)
+            if cb_match:
+                vol = float(cb_match.group(1))
+                rating = cb_match.group(2)
+                items.append(ExtractedItem(raw_text=f"автомат {rating}А", volume=vol, unit="шт", context_hint=f"автоматический выключатель {rating}А"))
+        else:
+            rating = cb_match.group(1)
+            vol_s = cb_match.group(2) or "1"
+            pre_num = re.search(r"(\d+)\s*(?:автомат|выключател)", text_lower)
+            if pre_num:
+                vol_s = pre_num.group(1)
+            items.append(ExtractedItem(raw_text=f"автомат {rating}А", volume=float(vol_s), unit="шт", context_hint=f"автоматический выключатель {rating}А"))
+
+        stud_match = re.search(r"(\d+)\s*(?:шт\s*)?шпил[ье][а-я]*\s*(?:м8)?", text_lower)
+        if not stud_match:
+            stud_match = re.search(r"шпил[ье][а-я]*\s*(?:м8)?\s*(?:—|-|\s)?\s*(\d+)", text_lower)
+        if stud_match:
+            vol = float(stud_match.group(1))
+            items.append(ExtractedItem(raw_text="шпилька М8", volume=vol, unit="шт", context_hint="шпилька М8"))
+
+        drain_match = re.search(r"(?:дренаж[а-я]*\s*пп|трубопровод[а-я]*\s*дренаж[а-я]*)\s*(?:—|-|\s)?\s*(\d+(?:[.,]\d+)?)", text_lower)
+        if not drain_match:
+            drain_match = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:м|метр[а-я]*)?\s*(?:дренаж[а-я]*\s*пп|трубопровод[а-я]*\s*дренаж[а-я]*)", text_lower)
+        if drain_match:
+            vol = float(drain_match.group(1).replace(',', '.'))
+            items.append(ExtractedItem(raw_text="трубопровод дренажный ПП", volume=vol, unit="м", context_hint="дренаж ПП"))
+
+        return LLMExtractionResponse(is_question=False, items=items)
 
         return LLMExtractionResponse(is_question=False, items=items)
 

@@ -42,7 +42,6 @@ class Bitrix24Client:
         if not records:
             return False, "Список позиций пуст."
 
-        # Формирование описания задачи
         desc_lines = [
             f"[B]Ежедневный отчет мастера ({user_name}) за {date_str}[/B]\n",
             f"[B]Исходное сообщение мастера:[/B] \"{raw_text}\"\n",
@@ -69,7 +68,6 @@ class Bitrix24Client:
             }
         }
 
-        # 1. Сначала пробуем прямое подключение в обход VPN через LAN-адаптер (если включен VPN)
         lan_transport = _get_lan_transport()
         transports_to_try = [lan_transport, None] if lan_transport else [None]
 

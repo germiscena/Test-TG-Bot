@@ -2,7 +2,6 @@ import asyncio
 import logging
 import time
 from typing import List, Dict, Tuple, Optional
-from pathlib import Path
 
 from config.settings import settings
 from src.core.models import Position
@@ -45,7 +44,6 @@ class GoogleSheetsRepository:
                 except Exception as e:
                     logger.error(f"Failed to fetch from Google Sheets: {e}. Falling back to CSV.")
 
-            # Fallback to local CSV
             positions, dates = parse_csv_file(settings.FALLBACK_CSV_PATH)
             self._cached_positions = positions
             self._cached_dates = dates
@@ -65,28 +63,34 @@ class GoogleSheetsRepository:
     async def record_daily_volumes(
         self,
         date_str: str,
-        records: List[Tuple[Position, float]]
+        records: List[Tuple[Position, float]],
+        overwrite: bool = False
     ) -> Tuple[bool, str]:
         """
         Записывает выполненные объемы в столбец с датой date_str (YYYY-MM-DD).
-        Режим накопления (Суммирование): к имеющемуся значению прибавляется новый объем.
+        Если overwrite=False: прибавляет к имеющемуся значению (накопление).
+        Если overwrite=True: заменяет имеющееся значение (исправление за сегодня).
         """
         if not records:
             return False, "Список позиций для записи пуст."
 
         if not settings.has_google_credentials:
-            # Режим локальной эмуляции (offline test mode)
             summary_lines = []
             for pos, vol in records:
-                pos.executed_volume += vol
-                pos.remaining_volume = max(0.0, pos.remaining_volume - vol)
-                summary_lines.append(f"Строка {pos.row_index}: +{vol} {pos.unit} ({pos.name[:40]}...)")
+                if overwrite:
+                    pos.executed_volume = vol
+                    pos.remaining_volume = max(0.0, pos.plan_volume - vol)
+                    summary_lines.append(f"Строка {pos.row_index}: заменено на {vol} {pos.unit} ({pos.short_name})")
+                else:
+                    pos.executed_volume += vol
+                    pos.remaining_volume = max(0.0, pos.remaining_volume - vol)
+                    summary_lines.append(f"Строка {pos.row_index}: +{vol} {pos.unit} ({pos.short_name})")
             details = "\n".join(summary_lines)
-            return True, f"Записано в локальном режиме (эмуляция Google Sheets):\n{details}"
+            action_desc = "исправлено (замена)" if overwrite else "дополнено (накопление)"
+            return True, f"Записано в локальном режиме ({action_desc}):\n{details}"
 
-        # Запись в живую Google Таблицу через gspread
         try:
-            return await asyncio.to_thread(self._write_to_google_sheets, date_str, records)
+            return await asyncio.to_thread(self._write_to_google_sheets, date_str, records, overwrite)
         except Exception as e:
             logger.error(f"Error writing to Google Sheets: {e}", exc_info=True)
             return False, f"Ошибка записи в Google Sheets: {str(e)}"
@@ -94,7 +98,8 @@ class GoogleSheetsRepository:
     def _write_to_google_sheets(
         self,
         date_str: str,
-        records: List[Tuple[Position, float]]
+        records: List[Tuple[Position, float]],
+        overwrite: bool = False
     ) -> Tuple[bool, str]:
         import gspread
         gc = gspread.service_account(filename=settings.GOOGLE_SERVICE_ACCOUNT_FILE)
@@ -105,26 +110,32 @@ class GoogleSheetsRepository:
         parser = EstimateSheetParser(all_values)
         _, date_col_map = parser.parse()
 
-        date_row_idx = parser.date_row_index  # 0-based
+        date_row_idx = parser.date_row_index
         if date_row_idx == -1:
-            date_row_idx = 2  # default row 3 in sheet
+            date_row_idx = 2
 
-        # 1. Проверяем или создаем столбец с текущей датой
         if date_str in date_col_map:
             col_idx_0based = date_col_map[date_str]
         else:
-            # Находим правый край колонок с датами
             max_col = max(date_col_map.values()) if date_col_map else 9
             col_idx_0based = max_col + 1
-            # Записываем заголовок даты
-            worksheet.update_cell(date_row_idx + 1, col_idx_0based + 1, date_str)
-            # Подзаголовок "объем"
-            worksheet.update_cell(date_row_idx + 2, col_idx_0based + 1, "объем")
+            col_1based = col_idx_0based + 1
+
+            if col_1based > worksheet.col_count:
+                worksheet.add_cols(col_1based - worksheet.col_count + 5)
+
+            header_updates = [
+                {'range': gspread.utils.rowcol_to_a1(date_row_idx + 1, col_1based), 'values': [[date_str]]},
+                {'range': gspread.utils.rowcol_to_a1(date_row_idx + 2, col_1based), 'values': [['объем']]}
+            ]
+            worksheet.batch_update(header_updates)
             date_col_map[date_str] = col_idx_0based
 
         col_1based = col_idx_0based + 1
 
-        # 2. Формируем пакет обновлений (Batch Update)
+        if col_1based > worksheet.col_count:
+            worksheet.add_cols(col_1based - worksheet.col_count + 5)
+
         updates = []
         summary = []
         for pos, new_volume in records:
@@ -140,8 +151,15 @@ class GoogleSheetsRepository:
                 except ValueError:
                     existing_val = 0.0
 
-            total_val = round(existing_val + new_volume, 3)
-            # Если число целое, пишем int
+            if overwrite:
+                total_val = round(new_volume, 3)
+                diff = new_volume - existing_val
+                summary_action = f"заменено на {new_volume} {pos.unit} (было {existing_val})"
+            else:
+                total_val = round(existing_val + new_volume, 3)
+                diff = new_volume
+                summary_action = f"{existing_val} + {new_volume} = {total_val} {pos.unit}"
+
             val_to_write = int(total_val) if total_val.is_integer() else total_val
 
             cell_coord = gspread.utils.rowcol_to_a1(row_1based, col_1based)
@@ -149,16 +167,54 @@ class GoogleSheetsRepository:
                 'range': cell_coord,
                 'values': [[val_to_write]]
             })
-            summary.append(f"Строка {row_1based}: {existing_val} + {new_volume} = {val_to_write} {pos.unit}")
+            summary.append(f"Строка {row_1based}: {summary_action}")
 
-            # Обновляем локальное состояние переданного объекта
-            pos.executed_volume += new_volume
-            pos.remaining_volume = max(0.0, pos.remaining_volume - new_volume)
+            pos.executed_volume += diff
+            pos.remaining_volume = max(0.0, pos.remaining_volume - diff)
 
         worksheet.batch_update(updates)
         self.invalidate_cache()
-        return True, f"Успешно записано в Google Sheets ({date_str}):\n" + "\n".join(summary)
+        mode_text = "Исправлено (перезапись)" if overwrite else "Дополнено (накопление)"
+        return True, f"Успешно записано в Google Sheets [{mode_text}] ({date_str}):\n" + "\n".join(summary)
+
+    async def get_today_records(self, date_str: str) -> List[Tuple[Position, float]]:
+        """Возвращает список позиций, которые уже имеют ненулевой объем за указанную дату."""
+        if not settings.has_google_credentials:
+            return []
+
+        try:
+            return await asyncio.to_thread(self._fetch_today_records, date_str)
+        except Exception as e:
+            logger.error(f"Error fetching today records: {e}")
+            return []
+
+    def _fetch_today_records(self, date_str: str) -> List[Tuple[Position, float]]:
+        import gspread
+        gc = gspread.service_account(filename=settings.GOOGLE_SERVICE_ACCOUNT_FILE)
+        sh = gc.open_by_key(settings.GOOGLE_SPREADSHEET_ID)
+        worksheet = sh.worksheet(settings.GOOGLE_SHEET_NAME)
+
+        all_values = worksheet.get_all_values()
+        parser = EstimateSheetParser(all_values)
+        positions, date_col_map = parser.parse()
+
+        col_idx = date_col_map.get(date_str)
+        if col_idx is None:
+            return []
+
+        result = []
+        for pos in positions:
+            r = pos.row_index - 1
+            if r < len(all_values) and col_idx < len(all_values[r]):
+                val_s = all_values[r][col_idx].strip()
+                if val_s:
+                    try:
+                        v = float(val_s.replace(',', '.'))
+                        if v > 0:
+                            result.append((pos, v))
+                    except ValueError:
+                        pass
+        return result
 
 
-# Синглтон репозитория
 sheets_repo = GoogleSheetsRepository()

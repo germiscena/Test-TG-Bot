@@ -1,6 +1,11 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from aiogram import Router
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
+from config.settings import settings
+from src.bot.keyboards import get_success_keyboard
+from src.bot.formatters import format_number
 from src.integrations.google_sheets.repository import sheets_repo
 
 router = Router(name="common_router")
@@ -16,6 +21,8 @@ async def cmd_start(message: Message):
         "<i>Пример: «Сегодня проложили медь 6-ку 15 м и 9-ку 15 м, изоляцию на них столько же, кабель 3х2,5 — 56 м, поставили 10 хомутов под фреон»</i>\n\n"
         "<b>Дополнительные возможности:</b>\n"
         "• Спросите остаток: <i>«Сколько осталось по кабелю 3х2,5?»</i>\n"
+        "• /today — посмотреть, что уже записано за сегодня\n"
+        "• /sheet — ссылка на рабочую Google Таблицу\n"
         "• /sync — обновить справочник позиций из Google Таблицы\n"
         "• /catalog — посмотреть структуру сметы и количество позиций\n"
         "• /help — подробная справка"
@@ -29,12 +36,55 @@ async def cmd_help(message: Message):
         "🛠 <b>Справка по боту:</b>\n\n"
         "1. <b>Голосовой отчет:</b> зажмите микрофон и надиктуйте, что сделали за день.\n"
         "2. <b>Подтверждение:</b> бот сопоставит ваши слова со сметой и покажет карточку для проверки. "
-        "Вы сможете изменить цифры или удалить ошибочные строки перед записью.\n"
-        "3. <b>Запись:</b> при подтверждении объемы записываются в Google Таблицу в столбец с текущей датой "
-        "и передаются в задачу Битрикс24.\n"
-        "4. <b>Повторный отчет:</b> если прислать еще отчет за сегодня — объемы суммируются."
+        "Вы можете изменить цифры, удалить ошибочные строки или добавить забытое.\n"
+        "3. <b>Выбор режима записи:</b>\n"
+        "   • <i>«Записать (прибавить к сегодня)»</i> — суммирует новый объем с уже внесенным.\n"
+        "   • <i>«Заменить (исправить данные за сегодня)»</i> — перезаписывает ячейку за сегодня новым значением.\n"
+        "4. <b>Просмотр таблицы:</b> команда /sheet или кнопка со ссылкой после сохранения."
     )
     await message.answer(help_text, parse_mode="HTML")
+
+
+@router.message(Command("sheet", "table"))
+async def cmd_sheet(message: Message):
+    url = settings.sheet_web_url
+    if url:
+        await message.answer(
+            f"📊 <b>Рабочая Google Таблица объекта:</b>\n{url}",
+            reply_markup=get_success_keyboard(),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("Ссылка на таблицу не настроена в .env.")
+
+
+@router.message(Command("today"))
+async def cmd_today(message: Message):
+    try:
+        tz = ZoneInfo(settings.TIMEZONE)
+    except Exception:
+        tz = None
+    today = datetime.now(tz=tz).strftime("%Y-%m-%d")
+
+    records = await sheets_repo.get_today_records(today)
+    if not records:
+        await message.answer(
+            f"📅 <b>Данные за сегодня ({today}):</b>\n\n"
+            f"За сегодняшнее число еще не внесено ни одной записи.\n"
+            f"Отправьте текст или голосовое сообщение с выполненными работами!",
+            reply_markup=get_success_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    lines = [f"📅 <b>Внесенные данные за сегодня ({today}):</b>\n"]
+    for idx, (pos, vol) in enumerate(records, 1):
+        lines.append(f"{idx}. {pos.short_name} — <b>{format_number(vol)} {pos.unit}</b>")
+
+    lines.append(f"\nВсего позиций за сегодня: <b>{len(records)}</b>.")
+    lines.append("<i>Чтобы исправить данные, отправьте отчет и нажмите кнопку «Заменить (исправить данные за сегодня)».</i>")
+
+    await message.answer("\n".join(lines), reply_markup=get_success_keyboard(), parse_mode="HTML")
 
 
 @router.message(Command("sync"))

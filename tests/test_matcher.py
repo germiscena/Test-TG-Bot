@@ -29,40 +29,34 @@ async def test_tz_main_example(catalog):
     matched = matching_service.match_all(extraction.items, catalog)
     assert len(matched) >= 6
 
-    # 1. Медь 6-ка -> Фреонопровод Д6,35
     m6 = next(m for m in matched if "6-ка" in m.extracted.raw_text)
     assert m6.status == MatchStatus.CONFIRMED
     assert "6,35" in m6.position.name
     assert m6.extracted.volume == 15.0
     assert m6.position.unit == "м"
 
-    # 2. Медь 9-ка -> Фреонопровод Д9,52
     m9 = next(m for m in matched if "9-ка" in m.extracted.raw_text)
     assert m9.status == MatchStatus.CONFIRMED
     assert "9,52" in m9.position.name
     assert m9.extracted.volume == 15.0
 
-    # 3. Изоляция на 6-ку -> Трубка теплоизоляционная Д6,35
     iso6 = next(m for m in matched if "изоляция" in m.extracted.raw_text and "6" in m.extracted.raw_text)
     assert iso6.status == MatchStatus.CONFIRMED
     assert "теплоизоляционная" in iso6.position.name
     assert "6,35" in iso6.position.name
     assert iso6.extracted.volume == 15.0
 
-    # 4. Изоляция на 9-ку -> Трубка теплоизоляционная Д9,52
     iso9 = next(m for m in matched if "изоляция" in m.extracted.raw_text and "9" in m.extracted.raw_text)
     assert iso9.status == MatchStatus.CONFIRMED
     assert "теплоизоляционная" in iso9.position.name
     assert "9,52" in iso9.position.name
     assert iso9.extracted.volume == 15.0
 
-    # 5. Кабель 3х2,5 -> Кабель силовой сечением 3х2,5
     cable = next(m for m in matched if "кабель" in m.extracted.raw_text and "3х2,5" in m.extracted.raw_text)
     assert cable.status == MatchStatus.CONFIRMED
     assert "3х2,5" in cable.position.name
     assert cable.extracted.volume == 56.0
 
-    # 6. Хомуты под фреон -> Хомут для крепления фреонопровода
     clamp = next(m for m in matched if "хомут" in m.extracted.raw_text)
     assert clamp.status == MatchStatus.CONFIRMED
     assert "фреонопровода" in clamp.position.name

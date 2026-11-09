@@ -10,29 +10,34 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-    # Telegram
     TELEGRAM_BOT_TOKEN: str = "123456789:AAG_mock_token_for_testing_12345"
 
-    # OpenAI / LLM
     OPENAI_API_KEY: str = "mock_openai_key"
     OPENAI_BASE_URL: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
     WHISPER_MODEL: str = "whisper-1"
 
-    # Google Sheets
+    GROQ_API_KEY: Optional[str] = None
+
     GOOGLE_SERVICE_ACCOUNT_FILE: str = "data/service_account.json"
     GOOGLE_SPREADSHEET_ID: Optional[str] = None
     GOOGLE_SHEET_NAME: str = "Лист1"
     GOOGLE_SHEET_URL: Optional[str] = None
 
-    # Bitrix24
     BITRIX24_WEBHOOK_URL: Optional[str] = None
     BITRIX24_RESPONSIBLE_ID: int = 1
 
-    # App Settings
     TIMEZONE: str = "Europe/Moscow"
     CACHE_TTL_SECONDS: int = 300
     FALLBACK_CSV_PATH: str = "data/sample_estimate.csv"
+
+    @property
+    def sheet_web_url(self) -> Optional[str]:
+        if self.GOOGLE_SHEET_URL:
+            return self.GOOGLE_SHEET_URL
+        if self.GOOGLE_SPREADSHEET_ID:
+            return f"https://docs.google.com/spreadsheets/d/{self.GOOGLE_SPREADSHEET_ID}/edit"
+        return None
 
     @property
     def has_google_credentials(self) -> bool:

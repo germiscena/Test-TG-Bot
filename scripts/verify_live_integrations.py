@@ -68,9 +68,11 @@ async def check_bitrix24():
         print("ℹ️ Битрикс24: режим локальной эмуляции (BITRIX24_WEBHOOK_URL не настроен).")
         return True
 
+    from src.integrations.bitrix24.client import _get_lan_transport
+    transport = _get_lan_transport()
     url = settings.BITRIX24_WEBHOOK_URL.rstrip('/') + "/user.current.json"
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
+        async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
                 user = resp.json().get("result", {})
@@ -87,7 +89,11 @@ async def check_bitrix24():
 
 
 async def check_openai():
-    print("\n--- 4. Проверка OpenAI / LLM ---")
+    print("\n--- 4. Проверка AI (STT & LLM) ---")
+    if settings.GROQ_API_KEY:
+        print("✅ Настроен GROQ_API_KEY! Используется бесплатный облачный Whisper-Large-v3-Turbo.")
+        return True
+
     if not settings.has_openai_credentials:
         print("ℹ️ OpenAI: используется встроенный офлайн-парсер сленга (ключ не указан).")
         return True

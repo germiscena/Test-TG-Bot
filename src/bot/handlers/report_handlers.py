@@ -7,8 +7,8 @@ from rapidfuzz import fuzz
 
 from src.bot.states import ReportStates
 from src.bot.keyboards import get_clarification_keyboard, get_review_keyboard
-from src.bot.formatters import format_draft_message, format_position_info
-from src.core.models import ReportDraft, MatchedItem
+from src.bot.formatters import format_draft_message, format_position_info, format_clarification_message
+from src.core.models import ReportDraft
 from src.services.stt_service import stt_service
 from src.services.llm_service import llm_service
 from src.services.matching_service import matching_service
@@ -22,12 +22,10 @@ router = Router(name="report_router")
 async def handle_voice_report(message: Message, state: FSMContext, bot: Bot):
     status_msg = await message.answer("🎧 <i>Слушаю голосовое сообщение...</i>", parse_mode="HTML")
     try:
-        # Скачиваем голосовой файл
         file_io = io.BytesIO()
         await bot.download(message.voice, destination=file_io)
         voice_bytes = file_io.getvalue()
 
-        # Транскрибируем через Whisper
         recognized_text = await stt_service.transcribe_audio_bytes(voice_bytes)
         await status_msg.edit_text(f"🎙 <b>Распознано:</b> «{recognized_text}»", parse_mode="HTML")
 
@@ -43,11 +41,9 @@ async def handle_text_report(message: Message, state: FSMContext):
 
 
 async def process_report_text(text: str, is_voice: bool, message: Message, state: FSMContext):
-    # 1. Извлечение сущностей через LLM-сервис
     extraction = await llm_service.extract_items(text)
     catalog = await sheets_repo.get_catalog()
 
-    # Проверка на вопрос об остатке ("Будет плюсом" в ТЗ)
     if extraction.is_question and extraction.question_query:
         query = extraction.question_query.lower()
         best_pos = None
@@ -64,7 +60,6 @@ async def process_report_text(text: str, is_voice: bool, message: Message, state
             await message.answer(f"По запросу <i>«{query}»</i> позиция в смете не найдена.", parse_mode="HTML")
         return
 
-    # Проверка, найдены ли работы в сообщении
     if not extraction.items:
         await message.answer(
             "Не удалось распознать работы и объемы в сообщении.\n"
@@ -74,7 +69,6 @@ async def process_report_text(text: str, is_voice: bool, message: Message, state
         )
         return
 
-    # 2. Сопоставление с каталогом
     matched_items = matching_service.match_all(extraction.items, catalog)
 
     draft = ReportDraft(
@@ -85,22 +79,17 @@ async def process_report_text(text: str, is_voice: bool, message: Message, state
         items=matched_items
     )
 
-    # Сохраняем черновик в FSM
     await state.update_data(draft=draft.model_dump())
 
-    # 3. Если есть неоднозначные позиции - запускаем диалог уточнения
     if draft.has_unresolved:
         first_unresolved = draft.unresolved_items[0]
         await state.set_state(ReportStates.clarifying_item)
         await message.answer(
-            f"⚠️ <b>Позиция требует уточнения:</b>\n"
-            f"В речи: <i>«{first_unresolved.extracted.raw_text}»</i> (объем: {first_unresolved.extracted.volume} {first_unresolved.extracted.unit or ''})\n\n"
-            f"Выберите нужную строку из сметы:",
+            format_clarification_message(first_unresolved),
             reply_markup=get_clarification_keyboard(first_unresolved),
             parse_mode="HTML"
         )
     else:
-        # Все позиции уверенно сопоставлены - показываем карточку подтверждения
         await state.set_state(ReportStates.reviewing_draft)
         await message.answer(
             format_draft_message(draft),

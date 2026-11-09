@@ -4,7 +4,6 @@ from typing import List, Dict, Tuple, Optional
 from src.core.models import Position
 
 
-# Таблица замены типичных OCR-артефактов и латинских гомоглифов в русскоязычном тексте
 HOMOGLYPH_MAP = {
     'T': 'Т', 'y': 'у', 'p': 'р', 'o': 'о', 'm': 'т', 'a': 'а', 'c': 'с', 'e': 'е', 'x': 'х', 'u': 'и',
     'A': 'А', 'B': 'В', 'E': 'Е', 'K': 'К', 'M': 'М', 'H': 'Н', 'O': 'О', 'P': 'Р', 'C': 'С', 'X': 'Х',
@@ -32,21 +31,17 @@ def clean_text(text: str) -> str:
     if not text:
         return ""
     
-    # Замена неразрывных пробелов и множественных пробелов
     text = text.replace('\xa0', ' ').strip()
     text = re.sub(r'\s+', ' ', text)
     
-    # 1. Сначала применяем специфические regex-замены для артефактов
     for pattern, repl in KNOWN_REPLACEMENTS:
         text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
 
-    # 2. Исправление латинских гомоглифов
     chars = []
     for ch in text:
         chars.append(HOMOGLYPH_MAP.get(ch, ch))
     result = "".join(chars)
 
-    # Повторная проверка regex после замены гомоглифов
     for pattern, repl in KNOWN_REPLACEMENTS:
         result = re.sub(pattern, repl, result, flags=re.IGNORECASE)
 
@@ -72,7 +67,7 @@ class EstimateSheetParser:
 
     def __init__(self, raw_rows: List[List[str]]):
         self.raw_rows = raw_rows
-        self.date_col_map: Dict[str, int] = {}  # date_str -> col_index (0-based)
+        self.date_col_map: Dict[str, int] = {}
         self.date_row_index: int = -1
         self.positions: List[Position] = []
 
@@ -83,18 +78,28 @@ class EstimateSheetParser:
 
     def _find_dates(self):
         """Поиск строки с датами (формат YYYY-MM-DD или DD.MM.YYYY)."""
-        date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+        date_pattern = re.compile(r'^(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4})$')
         
-        for r_idx, row in enumerate(self.raw_rows[:10]):  # ищем в первых 10 строках
+        for r_idx, row in enumerate(self.raw_rows[:10]):
             found_dates = {}
             for c_idx, cell in enumerate(row):
                 val = cell.strip()
                 if date_pattern.match(val):
-                    # Если дата встречается дважды (дубликат в CSV), сохраняем первый
                     if val not in found_dates:
                         found_dates[val] = c_idx
+
+                    if re.match(r'^\d{2}\.\d{2}\.\d{4}$', val):
+                        d, m, y = val.split('.')
+                        iso_val = f"{y}-{m}-{d}"
+                        if iso_val not in found_dates:
+                            found_dates[iso_val] = c_idx
+                    elif re.match(r'^\d{4}-\d{2}-\d{2}$', val):
+                        y, m, d = val.split('-')
+                        ru_val = f"{d}.{m}.{y}"
+                        if ru_val not in found_dates:
+                            found_dates[ru_val] = c_idx
             
-            if len(found_dates) >= 3:  # Если в строке найдено хотя бы 3 даты - это строка дат
+            if len(found_dates) >= 3:
                 self.date_row_index = r_idx
                 self.date_col_map = found_dates
                 break
@@ -110,7 +115,6 @@ class EstimateSheetParser:
             if not row:
                 continue
 
-            # Получаем основные поля с безопасной индексацией
             col_no = row[0].strip() if len(row) > 0 else ""
             raw_name = row[1].strip() if len(row) > 1 else ""
             unit = row[2].strip() if len(row) > 2 else ""
@@ -127,36 +131,31 @@ class EstimateSheetParser:
             name_lower = cleaned_name.lower()
             name_upper = cleaned_name.upper()
 
-            # Пропуск итоговых строк
             if any(marker in name_upper for marker in ["ИТОГО ПО", "ВСЕГО ЗА", "ИТОГО"]):
                 continue
 
-            # Определение основных разделов (ОВ 3, ЭМ3)
             if cleaned_name in ["ОВ 3", "ОВ3", "ЭМ3", "ЭМ 3"] or (not unit and not qty_str and ("ОВ" in cleaned_name or "ЭМ" in cleaned_name)):
                 current_section = cleaned_name
                 current_subsection = None
                 continue
 
-            # Определение подразделов (нет единиц измерения и нет количества)
             if not unit and not qty_str:
                 current_subsection = cleaned_name
                 continue
 
-            # Если есть единица измерения или количество - это полноценная рабочая позиция
             norm_unit = unit.strip().lower()
             plan_qty = parse_float(qty_str)
             rate = parse_float(rate_str)
             tot_salary = parse_float(tot_sal_str)
             exec_qty = parse_float(exec_str)
 
-            # Вычисление остатка
             if rem_str:
                 rem_qty = parse_float(rem_str)
             else:
                 rem_qty = max(0.0, plan_qty - exec_qty)
 
             position = Position(
-                row_index=r_idx + 1,  # 1-based index в Google Sheets
+                row_index=r_idx + 1,
                 item_no=col_no if col_no else None,
                 section=current_section,
                 subsection=current_subsection,

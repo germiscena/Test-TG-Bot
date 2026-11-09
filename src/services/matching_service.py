@@ -1,6 +1,6 @@
 import re
 import logging
-from typing import List, Optional, Tuple
+from typing import List
 from rapidfuzz import fuzz
 
 from src.core.models import (
@@ -14,21 +14,20 @@ from src.core.models import (
 logger = logging.getLogger(__name__)
 
 
-# Специальные соответствия строительного сленга конкретным атрибутам
-# Важно: более специфичные правила (изоляция) должны идти ПЕРЕД общими (медь)!
 SLANG_PATTERNS = [
-    # Теплоизоляция (К-Флекс / трубка для фреонопроводов)
-    (r"(?:изоляци.*6|к-флекс.*6|термофлекс.*6)", "теплоизоляционная", "6,35", "м"),
-    (r"(?:изоляци.*9|к-флекс.*9|термофлекс.*9)", "теплоизоляционная", "9,52", "м"),
-    (r"(?:изоляци.*12|к-флекс.*12|термофлекс.*12)", "теплоизоляционная", "12.7", "м"),
-    # Фреонопроводы (медная труба)
+    (r"(?:изоляци.*(?:6|6[.,]35)|к-флекс.*(?:6|6[.,]35)|термофлекс.*(?:6|6[.,]35))", "теплоизоляционная", "6,35", "м"),
+    (r"(?:изоляци.*(?:9|10|9[.,]52)|к-флекс.*(?:9|10|9[.,]52)|термофлекс.*(?:9|10|9[.,]52))", "теплоизоляционная", "9,52", "м"),
+    (r"(?:изоляци.*(?:12|12[.,]7)|к-флекс.*(?:12|12[.,]7)|термофлекс.*(?:12|12[.,]7))", "теплоизоляционная", "12.7", "м"),
     (r"(?:медь\s*6|шест[её]рк|фреон.*6[.,]35)", "фреонопровод", "6,35", "м"),
-    (r"(?:медь\s*9|девятк|фреон.*9[.,]52)", "фреонопровод", "9,52", "м"),
+    (r"(?:медь\s*(?:9|10)|девятк|десятк|фреон.*(?:9[.,]52|10))", "фреонопровод", "9,52", "м"),
     (r"(?:медь\s*12|двенашк|фреон.*12[.,]7)", "фреонопровод", "12.7", "м"),
-    # Хомуты
     (r"хомут.*фреон", "хомут для крепления фреонопровода", None, "шт"),
     (r"хомут.*дренаж", "хомут для крепления дренажа", None, "шт"),
-    # Трубы ПВХ
+    (r"(?:автомат.*16|выключател.*16|16\s*а\b)", "автоматический выключатель", "16а", "шт"),
+    (r"(?:автомат.*20|выключател.*20|20\s*а\b)", "автоматический выключатель", "20а", "шт"),
+    (r"(?:автомат.*32|выключател.*32|32\s*а\b)", "автоматический выключатель", "32а", "шт"),
+    (r"шпильк.*(?:м8|1000|метр)", "шпилька м8", None, "шт"),
+    (r"(?:дренаж.*пп|трубопровод.*дренаж.*пп)", "трубопровод дренажный пп", None, "м"),
     (r"пвх\s*20", "труба пвх", "20", "м"),
     (r"пвх\s*25", "труба пвх", "25", "м"),
 ]
@@ -48,61 +47,55 @@ class MatchingService:
         query_text = f"{extracted.raw_text} {extracted.context_hint or ''}".lower().strip()
         matched_item = MatchedItem(extracted=extracted)
 
-        # 1. Проверка случая со сверлением отверстий (строки 44 и 45)
         if "сверлен" in query_text or "отверсти" in query_text:
             drilling_candidates = [p for p in catalog if "сверление отверстий" in p.normalized_name]
             if len(drilling_candidates) >= 2:
-                # Если в речи явно указано назначение:
                 if "фреон" in query_text:
-                    # Строка 44 (смета 18 под фреонопроводы)
                     chosen = next((p for p in drilling_candidates if p.plan_volume == 18.0), drilling_candidates[0])
                     return self._confirm_match(matched_item, chosen)
                 elif "дренаж" in query_text:
-                    # Строка 45 (смета 26 под дренажные трубы)
                     chosen = next((p for p in drilling_candidates if p.plan_volume == 26.0), drilling_candidates[1])
                     return self._confirm_match(matched_item, chosen)
                 else:
-                    # Мастер НЕ уточнил -> возвращаем статус NEEDS_CLARIFICATION с обоими кандидатами
                     matched_item.status = MatchStatus.NEEDS_CLARIFICATION
+                    matched_item.clarification_title = "Уточните назначение отверстий (фреонопровод или дренаж):"
                     matched_item.candidates = [
                         CandidateMatch(
                             position=p,
                             score=90.0,
-                            reason=f"Под фреонопроводы (смета {p.plan_volume} шт)" if p.plan_volume == 18.0 else f"Под дренажные трубы (смета {p.plan_volume} шт)"
+                            reason=f"Под фреонопроводы (смета {p.plan_volume:g} шт)" if p.plan_volume == 18.0 else f"Под дренажные трубы (смета {p.plan_volume:g} шт)"
                         )
                         for p in drilling_candidates
                     ]
                     return matched_item
 
-        # 2. Проверка случая хомутов без уточнения назначения
         if "хомут" in query_text and "фреон" not in query_text and "дренаж" not in query_text:
             clamp_candidates = [p for p in catalog if "хомут для крепления" in p.normalized_name]
             if len(clamp_candidates) >= 2:
                 matched_item.status = MatchStatus.NEEDS_CLARIFICATION
+                matched_item.clarification_title = "Уточните назначение хомутов (фреонопровод или дренаж):"
                 matched_item.candidates = [
                     CandidateMatch(
                         position=p,
                         score=85.0,
-                        reason=f"{p.name} (остаток {p.remaining_volume} {p.unit})"
+                        reason=p.short_name
                     )
                     for p in clamp_candidates
                 ]
                 return matched_item
 
-        # 3. Проверка кабелей по сечению (3х2,5, 3х1,5, 4х1,5 и т.д.)
         cable_match = re.search(r"(\d+[хx]\d+(?:[.,]\d+)?)", query_text)
         if "кабел" in query_text and cable_match:
             sec_target = cable_match.group(1).replace('x', 'х').replace('.', ',')
+            if re.match(r"^\d+х25$", sec_target):
+                sec_target = sec_target.replace("25", "2,5")
             cables = [p for p in catalog if "кабель" in p.normalized_name and sec_target in p.normalized_name.replace('x', 'х')]
             if len(cables) == 1:
                 return self._confirm_match(matched_item, cables[0])
             elif len(cables) > 1:
-                # Если несколько кабелей одного сечения (например, негорючий vs термический барьер)
-                # Берем самый частый или спрашиваем
                 cables.sort(key=lambda p: p.plan_volume, reverse=True)
                 return self._confirm_match(matched_item, cables[0])
 
-        # 4. Проверка сленговых паттернов (медь 6, 9, 12, изоляция)
         for pattern, keyword, dimension, unit in SLANG_PATTERNS:
             if re.search(pattern, query_text):
                 filtered = [
@@ -113,16 +106,43 @@ class MatchingService:
                 if filtered:
                     return self._confirm_match(matched_item, filtered[0])
 
-        # 5. Fuzzy Matching через RapidFuzz
+        if "изоляци" in query_text or "к-флекс" in query_text or "термофлекс" in query_text:
+            ins_candidates = [p for p in catalog if "теплоизоляционная" in p.normalized_name]
+            if ins_candidates:
+                matched_item.status = MatchStatus.NEEDS_CLARIFICATION
+                matched_item.clarification_title = "Уточните диаметр теплоизоляции из сметы:"
+                matched_item.candidates = [
+                    CandidateMatch(
+                        position=p,
+                        score=85.0,
+                        reason=p.short_name
+                    )
+                    for p in ins_candidates
+                ]
+                return matched_item
+
+        if ("медь" in query_text or "фреон" in query_text) and "хомут" not in query_text and "сверлен" not in query_text and "отверсти" not in query_text:
+            copper_candidates = [p for p in catalog if "фреонопровод медный" in p.normalized_name]
+            if copper_candidates:
+                matched_item.status = MatchStatus.NEEDS_CLARIFICATION
+                matched_item.clarification_title = "В смете нет указанного диаметра медной трубы. Выберите подходящий фреонопровод:"
+                matched_item.candidates = [
+                    CandidateMatch(
+                        position=p,
+                        score=85.0,
+                        reason=p.short_name
+                    )
+                    for p in copper_candidates
+                ]
+                return matched_item
+
         scored_candidates: List[CandidateMatch] = []
         for pos in catalog:
             score = fuzz.token_set_ratio(query_text, pos.normalized_name)
             
-            # Бонус, если совпадает единица измерения
             if extracted.unit and extracted.unit.lower() == pos.unit.lower():
                 score += 5
 
-            # Штраф, если в запросе есть числовые атрибуты (размеры), а в позиции их нет
             numbers_in_query = re.findall(r"\b\d+(?:[.,]\d+)?\b", query_text)
             for num in numbers_in_query:
                 num_norm = num.replace('.', ',')
@@ -140,14 +160,16 @@ class MatchingService:
             matched_item.status = MatchStatus.NOT_FOUND
             return matched_item
 
-        # Проверка отрыва первого кандидата от второго
         second = scored_candidates[1] if len(scored_candidates) > 1 else None
         if top.score >= 75 and (not second or (top.score - second.score >= 10)):
             return self._confirm_match(matched_item, top.position, confidence=top.score)
 
-        # Если несколько кандидатов имеют близкий балл
         matched_item.status = MatchStatus.NEEDS_CLARIFICATION
-        matched_item.candidates = scored_candidates[:3]
+        matched_item.clarification_title = "Найдено несколько похожих позиций в смете. Выберите нужную:"
+        matched_item.candidates = [
+            CandidateMatch(position=c.position, score=c.score, reason=c.position.short_name)
+            for c in scored_candidates[:3]
+        ]
         matched_item.confidence = top.score
         return matched_item
 
@@ -161,7 +183,6 @@ class MatchingService:
         item.position = position
         item.confidence = confidence
 
-        # Проверка остатка по смете ("Будет плюсом" в ТЗ)
         if item.extracted.volume > position.remaining_volume:
             item.warning = (
                 f"⚠️ Внимание: объем {item.extracted.volume} {position.unit} "

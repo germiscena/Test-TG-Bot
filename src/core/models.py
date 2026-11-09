@@ -12,7 +12,7 @@ class MatchStatus(str, Enum):
 
 
 class Position(BaseModel):
-    row_index: int  # 1-based row index in Google Sheet
+    row_index: int
     item_no: Optional[str] = None
     section: str = ""
     subsection: Optional[str] = None
@@ -26,9 +26,67 @@ class Position(BaseModel):
     remaining_volume: float = 0.0
 
     @property
-    def display_title(self) -> str:
-        sec = f"[{self.section}] " if self.section else ""
-        return f"{sec}{self.name[:60]}... ({self.unit})" if len(self.name) > 60 else f"{sec}{self.name} ({self.unit})"
+    def short_name(self) -> str:
+        """
+        Возвращает компактное и информативное наименование позиции для интерфейса Telegram.
+        Извлекает ключевые отличительные характеристики (диаметры труб/изоляции,
+        сечения кабелей, номиналы автоматов, назначение хомутов/отверстий).
+        """
+        import re
+        name = self.name.strip()
+        norm = self.normalized_name
+
+        if "фреонопровод медный" in norm:
+            m = re.search(r"[дdД]\s*(\d+(?:[.,]\d+)?)", name)
+            diam = m.group(1).replace(".", ",") if m else ""
+            inch_map = {"6,35": '1/4"', "9,52": '3/8"', "12,7": '1/2"', "12.7": '1/2"'}
+            inch = f" ({inch_map[diam]})" if diam in inch_map else ""
+            return f"Фреонопровод Д{diam}{inch}"
+
+        if "теплоизоляцион" in norm or "к-flex" in norm:
+            m = re.search(r"[дdД]\s*(\d+(?:[.,]\d+)?)", name)
+            diam = m.group(1).replace(".", ",") if m else ""
+            inch_map = {"6,35": '1/4"', "9,52": '3/8"', "12,7": '1/2"', "12.7": '1/2"'}
+            inch = f" ({inch_map[diam]})" if diam in inch_map else ""
+            return f"Изоляция К-FLEX Д{diam}{inch}"
+
+        if "кабель" in norm:
+            m = re.search(r"(\d+\s*[хx]\s*\d+(?:[.,]\d+)?)", name)
+            sec = m.group(1).replace("x", "х").replace(" ", "") if m else ""
+            extra = " (термобарьер)" if "термическ" in norm else ""
+            return f"Кабель {sec}{extra}"
+
+        if "автоматический выключатель" in norm or "выключател" in norm:
+            m = re.search(r"iр\s*=\s*(\d+)\s*а", norm)
+            if not m:
+                m = re.search(r"(\d+)\s*а\b", norm)
+            rating = m.group(1) if m else ""
+            return f"Автомат {rating}А (1п, C)"
+
+        if "сверление отверстий" in norm:
+            if self.plan_volume == 18.0:
+                return "Сверление под фреонопроводы (18 шт)"
+            elif self.plan_volume == 26.0:
+                return "Сверление под дренаж (26 шт)"
+            return f"Сверление Д80 ({self.plan_volume:g} шт)"
+
+        if "хомут" in norm:
+            if "фреон" in norm:
+                return "Хомут фреонопровода М8 32 мм"
+            elif "дренаж" in norm:
+                return "Хомут дренажа М8 25 мм"
+
+        if "труба пвх" in norm:
+            m = re.search(r"(\d+)\s*мм", norm)
+            d = m.group(1) if m else ""
+            return f"Труба ПВХ {d} мм"
+
+        if "шпилька" in norm:
+            return "Шпилька М8 1000 мм"
+
+        if len(name) <= 45:
+            return name
+        return name[:42] + "..."
 
 
 class ExtractedItem(BaseModel):
@@ -52,6 +110,7 @@ class MatchedItem(BaseModel):
     candidates: List[CandidateMatch] = Field(default_factory=list)
     confidence: float = 0.0
     warning: Optional[str] = None
+    clarification_title: Optional[str] = None
 
     @property
     def is_resolved(self) -> bool:
